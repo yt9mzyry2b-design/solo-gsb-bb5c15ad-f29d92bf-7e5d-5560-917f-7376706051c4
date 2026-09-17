@@ -70,18 +70,26 @@ function matchedTagsOf(paper: Paper, reviewer: Reviewer): string[] {
 }
 
 /**
- * 核心入口：执行盲审分配。
- *
- * 硬约束（全部必须满足，否则不可行）:
- *  1. 利益冲突：声明冲突的稿件-评审人对绝不分配；
- *  2. 容量：每位评审人承担稿件数不超过 capacity；
- *  3. 人数：每篇稿件恰好得到 reviewsRequired 位互不相同的评审人。
- *
- * 优化目标（硬约束满足后）:
- *  第一优先 最大化稿件主题标签与评审人擅长标签的匹配数；
- *  第二优先 最小化评审人最大负载（负载均衡）。
+ * 硬约束评估结果。
+ * 可行性、不可行原因与归一化后的输入一并返回，供分配主流程与缺席压力测试复用。
  */
-export function solveAssignment(rawData: AppData): AssignmentResult {
+export interface HardConstraintEvaluation {
+  feasible: boolean
+  reasons: InfeasibleReason[]
+  papers: Paper[]
+  reviewers: Reviewer[]
+  /** eligible[i][j] = true 表示稿件 i 与评审人 j 无冲突 */
+  eligible: boolean[][]
+  demands: number[]
+  capacities: number[]
+  totalRequired: number
+}
+
+/**
+ * 仅评估硬约束（冲突 / 容量 / 人数），不做任何目标优化、不改变输入数据。
+ * 缺席压力测试把某位评审人容量改为 0 后调用本函数，即“使用既有硬约束可行性逻辑重新判定”。
+ */
+export function evaluateHardConstraints(rawData: AppData): HardConstraintEvaluation {
   const { papers, reviewers } = normalize(rawData)
   const P = papers.length
   const R = reviewers.length
@@ -89,14 +97,32 @@ export function solveAssignment(rawData: AppData): AssignmentResult {
 
   // ---- 退化情形 ----
   if (P === 0) {
-    return { feasible: false, reasons: [{ kind: 'paper-eligible', message: '没有需要分配的有效稿件（请至少录入一篇需要评审的稿件）。' }] }
+    return {
+      feasible: false,
+      reasons: [{ kind: 'paper-eligible', message: '没有需要分配的有效稿件（请至少录入一篇需要评审的稿件）。' }],
+      papers,
+      reviewers,
+      eligible: [],
+      demands: [],
+      capacities: reviewers.map((r) => r.capacity),
+      totalRequired: 0
+    }
   }
   if (R === 0) {
     reasons.push({
       kind: 'global-capacity',
       message: `尚未录入任何评审人，${papers.reduce((a, p) => a + p.reviewsRequired, 0)} 个评审名额无人承担。`
     })
-    return { feasible: false, reasons }
+    return {
+      feasible: false,
+      reasons,
+      papers,
+      reviewers,
+      eligible: papers.map(() => []),
+      demands: papers.map((p) => p.reviewsRequired),
+      capacities: [],
+      totalRequired: papers.reduce((a, p) => a + p.reviewsRequired, 0)
+    }
   }
 
   // ---- 冲突矩阵 ----
@@ -163,13 +189,39 @@ export function solveAssignment(rawData: AppData): AssignmentResult {
     })
   }
 
-  if (!feas.feasible) {
-    // 优先展示具体原因：单篇不足在前，全局/组合性在后
-    return { feasible: false, reasons: [...perPaperFailures, ...reasons] }
+  return {
+    feasible: feas.feasible,
+    reasons: feas.feasible ? [] : [...perPaperFailures, ...reasons],
+    papers,
+    reviewers,
+    eligible,
+    demands,
+    capacities,
+    totalRequired
+  }
+}
+
+/**
+ * 核心入口：执行盲审分配。
+ *
+ * 硬约束（全部必须满足，否则不可行）:
+ *  1. 利益冲突：声明冲突的稿件-评审人对绝不分配；
+ *  2. 容量：每位评审人承担稿件数不超过 capacity；
+ *  3. 人数：每篇稿件恰好得到 reviewsRequired 位互不相同的评审人。
+ *
+ * 优化目标（硬约束满足后）:
+ *  第一优先 最大化稿件主题标签与评审人擅长标签的匹配数；
+ *  第二优先 最小化评审人最大负载（负载均衡）。
+ */
+export function solveAssignment(rawData: AppData): AssignmentResult {
+  // ---- 硬约束可行性（与缺席压力测试共用同一套判定逻辑） ----
+  const hc = evaluateHardConstraints(rawData)
+  if (!hc.feasible) {
+    return { feasible: false, reasons: hc.reasons }
   }
 
   // ---- 硬约束可行：用整数规划做目标优化 ----
-  return optimize(papers, reviewers, eligible, demands, totalRequired)
+  return optimize(hc.papers, hc.reviewers, hc.eligible, hc.demands, hc.totalRequired)
 }
 
 /* ------------------------------ 整数规划优化 ------------------------------ */

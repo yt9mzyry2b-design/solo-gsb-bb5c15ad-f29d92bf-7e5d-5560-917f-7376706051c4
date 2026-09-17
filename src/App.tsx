@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { AppData, AssignmentResult, Paper, Reviewer } from './types'
+import type { AppData, AssignmentResult, Paper, Reviewer, StressTestReport } from './types'
 import { loadData, saveData } from './storage'
-import { solveAssignment } from './engine/solver'
+import { solveAssignment, evaluateHardConstraints } from './engine/solver'
+import { runStressTest, stressFingerprint } from './engine/stress'
 import { createSampleData } from './sampleData'
-import { buildExportPayload, downloadJson } from './exporter'
+import { buildExportPayload, buildStressExportPayload, downloadJson } from './exporter'
 import { PapersPanel } from './components/PapersPanel'
 import { ReviewersPanel } from './components/ReviewersPanel'
 import { ResultPanel } from './components/ResultPanel'
+import { StressPanel } from './components/StressPanel'
 import './styles.css'
 
-type Tab = 'papers' | 'reviewers' | 'result'
+type Tab = 'papers' | 'reviewers' | 'result' | 'stress'
 
 const EMPTY: AppData = { papers: [], reviewers: [] }
 
@@ -20,6 +22,8 @@ export default function App() {
   const [stale, setStale] = useState(false)
   const [solving, setSolving] = useState(false)
   const [solveMillis, setSolveMillis] = useState<number | null>(null)
+  const [stressReport, setStressReport] = useState<StressTestReport | null>(null)
+  const [stressRunning, setStressRunning] = useState(false)
 
   // 数据变化自动持久化到 localStorage；已有结果则标记为过期
   useEffect(() => {
@@ -27,6 +31,15 @@ export default function App() {
     setStale((s) => (result ? true : s))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data])
+
+  // 硬约束基线评估：与“生成分派”同源，压力测试只在当前数据可生成方案时可运行（每次录入变化即时重算）
+  const baseline = useMemo(() => evaluateHardConstraints(data), [data])
+  const baselineFeasible = baseline.feasible
+  const baselineReasons = baseline.reasons.map((r) => r.message)
+
+  // 压力测试过期判定：报告保存了运行时数据指纹，当前指纹不一致即立即标记过期（复用基线归一化结果）
+  const currentFingerprint = useMemo(() => stressFingerprint(data, baseline), [data, baseline])
+  const stressStale = stressReport !== null && stressReport.fingerprint !== currentFingerprint
 
   const conflictCountOf = useMemo(() => {
     const map = new Map<string, number>()
@@ -51,6 +64,16 @@ export default function App() {
     }, 30)
   }
 
+  const runStress = () => {
+    // 与生成同理：先渲染“进行中”，再逐位同步跑最大流
+    setStressRunning(true)
+    setTimeout(() => {
+      const outcome = runStressTest(data)
+      if (outcome.runnable) setStressReport(outcome.report)
+      setStressRunning(false)
+    }, 30)
+  }
+
   const loadSample = () => {
     if (data.papers.length || data.reviewers.length) {
       if (!window.confirm('载入示例数据将覆盖当前录入内容，是否继续？')) return
@@ -58,6 +81,7 @@ export default function App() {
     setData(createSampleData())
     setResult(null)
     setStale(false)
+    setStressReport(null)
   }
 
   const clearAll = () => {
@@ -65,10 +89,18 @@ export default function App() {
     setData(EMPTY)
     setResult(null)
     setStale(false)
+    setStressReport(null)
   }
 
   const exportResult = () => {
     if (result?.feasible) downloadJson(buildExportPayload(data, result))
+  }
+
+  const exportStress = () => {
+    if (stressReport) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      downloadJson(buildStressExportPayload(data, stressReport), `blind-review-absence-stress-${stamp}.json`)
+    }
   }
 
   const totalRequired = data.papers.reduce((a, p) => a + Math.max(0, p.reviewsRequired || 0), 0)
@@ -111,6 +143,10 @@ export default function App() {
           分配结果
           {stale && <span className="stale-dot" title="数据已变更，结果可能过期">●</span>}
         </button>
+        <button className={tab === 'stress' ? 'tab active' : 'tab'} onClick={() => setTab('stress')}>
+          缺席压力测试
+          {stressStale && <span className="stale-dot" title="录入数据已变化，压力测试结果已过期">●</span>}
+        </button>
         {solveMillis !== null && <span className="solve-time">本地求解耗时 {solveMillis} ms</span>}
       </nav>
 
@@ -125,6 +161,18 @@ export default function App() {
           ) : (
             <ResultPanel data={data} result={result} onExport={exportResult} />
           ))}
+        {tab === 'stress' && (
+          <StressPanel
+            data={data}
+            baselineFeasible={baselineFeasible}
+            baselineReasons={baselineReasons}
+            report={stressReport}
+            stale={stressStale}
+            running={stressRunning}
+            onRun={runStress}
+            onExport={exportStress}
+          />
+        )}
       </main>
 
       <footer className="app-footer">

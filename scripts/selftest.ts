@@ -1,4 +1,5 @@
 import { solveAssignment } from '../src/engine/solver'
+import { runStressTest, stressFingerprint } from '../src/engine/stress'
 import type { AppData } from '../src/types'
 
 let pass = 0
@@ -138,6 +139,137 @@ const R = (id: string, name: string, capacity: number, tags: string[] = [], conf
   const ms = Date.now() - t0
   console.log(`用例8 规模 30x12（${ms} ms）`)
   check('可行且 90 个名额', res.feasible && res.objective.totalAssigned === 90, JSON.stringify(res.feasible ? res.objective : res.reasons))
+}
+
+/* ============================ 缺席压力测试 ============================ */
+
+// 9. 示例数据：总容量 9 仅比总需求 8 多 1，任何容量 ≥2 的评审人缺席都会击穿全局容量
+{
+  const d = mk(
+    [P('p1', 'LLM微调', 2, ['机器学习', 'NLP']), P('p2', 'GNN推荐', 2, ['机器学习', '推荐系统']), P('p3', 'KV存储', 2, ['分布式系统', '数据库']), P('p4', '联邦隐私', 2, ['安全', '机器学习'])],
+    [R('a', 'Alice', 2, ['机器学习', 'NLP'], ['p1']), R('b', 'Bob', 2, ['机器学习', '推荐系统']), R('c', 'Carol', 3, ['分布式系统', '数据库'], ['p3']), R('d', 'Dave', 2, ['安全', '机器学习'])]
+  )
+  const out = runStressTest(d)
+  console.log('用例9 缺席压力测试 · 示例数据')
+  check('可运行（基线可行）', out.runnable)
+  if (out.runnable) {
+    const rep = out.report
+    check('受测 4 人', rep.testedReviewerCount === 4)
+    check('汇总 0 仍可分配 / 4 不可分配（总容量仅余 1）', rep.feasibleCount === 0 && rep.infeasibleCount === 4, JSON.stringify(rep.scenarios.map((s) => [s.reviewerId, s.feasible])))
+    const carol = rep.scenarios.find((s) => s.reviewerId === 'c')
+    check('Carol 缺席不可行', !!carol && !carol.feasible)
+    check('Carol 缺席：全局名额缺口=2', carol?.globalDeficit === 2, `got ${carol?.globalDeficit}`)
+    check('Carol 缺席：剩余容量=6', carol?.remainingCapacity === 6)
+    check('Carol 缺席：受影响稿件 4 篇', carol?.affectedPapers?.length === 4, `got ${carol?.affectedPapers?.length}`)
+    check('Carol 缺席：瓶颈缺口=2', carol?.deficit === 2, `got ${carol?.deficit}`)
+    check('Carol 缺席：可选评审人瓶颈含其余 3 人', carol?.bottleneckReviewers?.length === 3 && !carol.bottleneckReviewers.some((b) => b.reviewerId === 'c'))
+    check('不可行项不止总容量：含受影响稿件与瓶颈评审人', rep.scenarios.every((s) => s.feasible || (!!s.affectedPapers?.length && !!s.bottleneckReviewers?.length)))
+    check('Alice/Bob/Dave 缺席全局缺口各为 1', ['a', 'b', 'd'].every((id) => rep.scenarios.find((s) => s.reviewerId === id)?.globalDeficit === 1))
+  }
+}
+
+// 10. 基线不可行时压力测试不可运行
+{
+  const d = mk([P('p1', 'A', 3, ['X'])], [R('a', '甲', 2, ['X'], ['p1']), R('b', '乙', 1), R('c', '丙', 1)])
+  const out = runStressTest(d)
+  console.log('用例10 基线不可行')
+  check('runnable=false 且带回原因', !out.runnable && 'reasons' in out && out.reasons.length > 0)
+}
+
+// 11. 全局容量充足但组合性瓶颈：缺席后“不能只报总容量不足”
+// 三篇各需 1；甲容量2 三篇均可评、乙容量2 三篇均可评、丙容量5 但对三篇全冲突。
+// 基线可行（甲乙分担）。甲缺席 → 只剩乙（容量2）可评三篇：每篇可选人数仍够（1=需求），
+// 但 Hall 缺口 1；此时剩余总容量 7 远大于需求 3，纯粹是组合性瓶颈。
+{
+  const d = mk(
+    [P('p1', 'A', 1), P('p2', 'B', 1), P('p3', 'C', 1)],
+    [R('a', '甲', 2, [], []), R('b', '乙', 2, [], []), R('c', '丙', 5, [], ['p1', 'p2', 'p3'])]
+  )
+  const base = solveAssignment(d)
+  console.log('用例11 缺席导致纯组合性瓶颈')
+  check('基线可行', base.feasible, JSON.stringify(base.feasible ? '' : base.reasons))
+  const out = runStressTest(d)
+  if (out.runnable) {
+    check('汇总：丙缺席仍可分配，甲乙缺席不可分配', out.report.feasibleCount === 1 && out.report.infeasibleCount === 2)
+    const a = out.report.scenarios.find((s) => s.reviewerId === 'a')
+    check('甲缺席不可行', !!a && !a.feasible)
+    check('甲缺席：全局总容量仍够（globalDeficit=0）', a?.globalDeficit === 0, `got ${a?.globalDeficit}`)
+    check('甲缺席：Hall 瓶颈缺口=1', a?.deficit === 1, `got ${a?.deficit}`)
+    check('甲缺席：受影响稿件 3 篇且单篇缺口均为0（仅组合瓶颈）', a?.affectedPapers?.length === 3 && a.affectedPapers.every((p) => p.shortfall === 0 && p.available === 1), JSON.stringify(a?.affectedPapers))
+    check('甲缺席：瓶颈评审人仅乙（冲突者丙排除、缺席者甲排除）', a?.bottleneckReviewers?.length === 1 && a.bottleneckReviewers[0].reviewerId === 'b' && a.bottleneckReviewers[0].capacityForGroup === 2)
+  }
+}
+
+// 12. 单篇可分配人数不足型缺席：p1 仅甲可选；乙/丙缺席不影响 → 该数据同时是“有仍有不可”的混合场景
+{
+  const d = mk(
+    [P('p1', 'A', 1), P('p2', 'B', 1)],
+    [R('a', '甲', 1, [], []), R('b', '乙', 1, [], ['p1']), R('c', '丙', 5, [], ['p1'])]
+  )
+  console.log('用例12 单点缺席（p1 只有甲）')
+  const out = runStressTest(d)
+  if (out.runnable) {
+    check('汇总：乙、丙缺席仍可分配（2），甲缺席不可分配（1）', out.report.feasibleCount === 2 && out.report.infeasibleCount === 1)
+    const a = out.report.scenarios.find((s) => s.reviewerId === 'a')
+    check('甲缺席不可行', !!a && !a.feasible)
+    const p1 = a?.affectedPapers?.find((p) => p.paperId === 'p1')
+    check('p1 剩余可选 0 人、单篇缺口 1', p1?.available === 0 && p1.shortfall === 1, JSON.stringify(p1))
+    check('甲缺席：无可选评审人瓶颈（其余全部与 p1 冲突）', (a?.bottleneckReviewers?.length ?? 0) === 0)
+  }
+}
+
+// 13. 全员冗余：任何人缺席都仍可分配
+{
+  const d = mk(
+    [P('p1', 'A', 1), P('p2', 'B', 1)],
+    [R('a', '甲', 2), R('b', '乙', 2), R('c', '丙', 2)]
+  )
+  console.log('用例13 全员冗余')
+  const out = runStressTest(d)
+  if (out.runnable) check('3 人缺席全部仍可分配', out.report.feasibleCount === 3 && out.report.infeasibleCount === 0)
+}
+
+// 14. 数据指纹：容量/冲突/需求等变化后指纹改变；无关顺序与展示名不影响
+{
+  const d1 = mk([P('p1', 'A', 2, ['x'])], [R('a', '甲', 2, ['X'], []), R('b', '乙', 1)])
+  const f1 = stressFingerprint(d1)
+  const d2: AppData = { papers: d1.papers, reviewers: [R('b', '乙', 1), R('a', '甲', 2, ['X'], [])] }
+  console.log('用例14 数据指纹与过期判定')
+  check('仅数组顺序变化指纹不变（归一化排序）', stressFingerprint(d2) === f1)
+  const d3 = mk([P('p1', 'A', 2, ['x'])], [R('a', '甲', 3, ['X'], []), R('b', '乙', 1)])
+  check('容量变化指纹改变（结果立即过期）', stressFingerprint(d3) !== f1)
+  const d4 = mk([P('p1', 'A', 1, ['x'])], d1.reviewers)
+  check('需求变化指纹改变', stressFingerprint(d4) !== f1)
+  const d5 = mk(d1.papers, [R('a', '甲', 2, ['X'], ['p1']), R('b', '乙', 1)])
+  check('冲突变化指纹改变', stressFingerprint(d5) !== f1)
+}
+
+// 15. 压力测试不改变录入数据（缺席模拟用副本）
+{
+  const d = mk([P('p1', 'A', 1)], [R('a', '甲', 1), R('b', '乙', 1)])
+  const snapshot = JSON.stringify(d)
+  runStressTest(d)
+  console.log('用例15 不修改录入数据')
+  check('运行后输入数据引用内容不变', JSON.stringify(d) === snapshot)
+  check('评审人容量仍为原值', d.reviewers.every((r) => r.capacity >= 1))
+}
+
+// 16. 基线含容量 0 的评审人：不参与受测；缺席诊断中“剩余可选人数”也不计入他们
+{
+  const d = mk(
+    [P('p1', 'A', 1), P('p2', 'B', 1)],
+    [R('a', '甲', 1), R('b', '乙', 1), R('z', '容量为零者', 0)]
+  )
+  const out = runStressTest(d)
+  console.log('用例16 容量0评审人')
+  if (out.runnable) {
+    check('仅受测 2 人（容量0者不参与）', out.report.testedReviewerCount === 2)
+    const a = out.report.scenarios.find((s) => s.reviewerId === 'a')
+    check('甲缺席不可行', !!a && !a.feasible)
+    const p1 = a?.affectedPapers?.find((p) => p.paperId === 'p1')
+    // z 容量为 0 不能承担名额；p1 缺席甲后只有乙可选（available=1，需求1，不缺），真正缺口在 Hall 组层面
+    check('p1 剩余可选计数不含容量0者（=1）', p1?.available === 1, JSON.stringify(p1))
+  }
 }
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)

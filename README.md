@@ -21,17 +21,29 @@
     - 全局容量不足（总名额缺口）；
     - 组合性瓶颈：哪一组稿件只能由哪几位评审人承担、缺口多少（Hall 条件违反的紧见证）。
 - **结果展示**：每篇稿件的分配明细与主题匹配标记、评审人负载进度条、匹配/负载统计、本地求解耗时。
+- **评审人缺席压力测试**：在顶部「**缺席压力测试**」标签页进入。
+  - 仅在**当前数据可生成可行方案**时可运行；对每位容量 > 0 的评审人分别模拟**完全缺席**（容量临时置 0），
+    使用与生成分派**完全相同的硬约束可行性逻辑**（Dinic 最大流）重新判定，**不改变录入数据或当前分配**。
+  - 结果按「**仍可分配 / 不可分配**」两组汇总；每个不可分配场景必须给出：
+    - **缺席者**；
+    - **受影响稿件**：广义 Hall 缺陷稿件组，逐稿列出需求、缺席后剩余可选评审人数、单篇缺口；
+    - **名额缺口**：组合性瓶颈缺口（Hall 紧见证）与全局剩余容量缺口两个口径——即使总容量仍充足，也能识别“调不开”的组合性瓶颈；
+    - **可选评审人瓶颈**：见证评审人集合及其容量、对受影响稿件组至多能承担的名额，而不是只报总容量不足。
+  - 录入数据（标题 / 需求 / 标签 / 评审人容量 / 冲突）一旦变化，报告立即在标签页上标记**已过期**，重新运行后更新。
+  - 支持**导出压力测试报告 JSON**。
 - **数据持久化**：录入内容自动保存到 localStorage，刷新或关闭页面不丢失。
-- **导出 JSON**：将分配结果（含稿件、评审人、匹配标签、负载与利用率）下载为 JSON 文件。
+- **导出 JSON**：将分配结果（含稿件、评审人、匹配标签、负载与利用率）下载为 JSON 文件；压力测试报告亦可单独导出。
 - 另附「载入示例」按钮，可快速体验。
 
 ## 一条命令启动（Docker Compose）
+
+应用入口为页面顶部导航的四个标签页：**稿件**、**评审人 / 利益冲突**、**分配结果**、**缺席压力测试**。
 
 ```bash
 docker compose up -d --build
 ```
 
-启动后访问：
+启动后在浏览器访问：
 
 > **http://localhost:8080**
 
@@ -60,6 +72,8 @@ npm run preview    # 预览生产构建，访问 http://localhost:4173
 ```
 
 ## 导出结果 JSON 结构
+
+分配结果导出（`分配结果` 页 → 导出结果 JSON，文件名 `blind-review-assignment-*.json`）：
 
 ```jsonc
 {
@@ -92,6 +106,42 @@ npm run preview    # 预览生产构建，访问 http://localhost:4173
 }
 ```
 
+压力测试报告导出（`缺席压力测试` 页 → 导出压力测试报告 JSON，文件名 `blind-review-absence-stress-*.json`）：
+
+```jsonc
+{
+  "exportedAt": "2026-09-17T08:00:00.000Z",
+  "kind": "reviewer-absence-stress-test",
+  "summary": {
+    "testedReviewerCount": 4,  // 受测评审人数（容量 > 0）
+    "totalRequired": 8,
+    "totalCapacity": 9,
+    "feasibleCount": 0,        // 缺席后仍可分配的人数
+    "infeasibleCount": 4       // 缺席后不可分配（单点风险）的人数
+  },
+  "scenarios": [
+    {
+      "reviewerId": "rev_carol",
+      "reviewerName": "Carol（系统/数据库）",
+      "capacity": 3,           // 被抽走的原容量
+      "feasible": false,
+      "message": "若 Carol（系统/数据库） 完全缺席，则无法生成可行分配。……",
+      "deficit": 2,            // 组合性瓶颈名额缺口（Hall 紧见证）
+      "globalDeficit": 2,      // 全局剩余容量缺口（为 0 时表示纯组合性瓶颈）
+      "remainingCapacity": 6,
+      "affectedPapers": [      // 受影响稿件
+        { "paperId": "paper_ml_001", "paperTitle": "面向大语言模型的高效微调方法", "required": 2, "available": 3, "shortfall": 0 }
+      ],
+      "bottleneckReviewers": [ // 可选评审人瓶颈
+        { "reviewerId": "rev_bob", "reviewerName": "Bob（推荐/ML）", "capacity": 2, "eligiblePaperCount": 4, "capacityForGroup": 2 }
+      ]
+    }
+  ]
+}
+```
+
+> 报告的“是否过期”由运行时录入数据指纹在页面对比判定（不写入额外文件）；数据变化后标签页会出现 ● 标记，重新运行即可刷新。
+
 ## 求解模型说明
 
 对每个无冲突的（稿件 i，评审人 j）对设置 0/1 变量 `x[i][j]`：
@@ -104,18 +154,23 @@ npm run preview    # 预览生产构建，访问 http://localhost:4173
 
 生成前先以 Dinic 最大流验证硬约束可行性：若不可行则不调用优化器，并通过最小割源侧集合定位瓶颈，给出可操作的修改提示。
 
+**缺席压力测试**不重新做目标优化：它把某位评审人的容量在临时数据副本中置 0（原录入数据与当前分配均不变），再次执行同一套硬约束评估。不可行时同样利用最小割源侧可达稿件集合作为广义 Hall 缺陷见证，输出受影响稿件、名额缺口（`需求(Z) − Σ_j∈Y min(容量_j, |Z 中可评稿件数|)`，另附全局剩余容量缺口口径）与可选评审人瓶颈 Y。
+
 ## 目录结构
 
 ```
 src/
   engine/
     maxflow.ts      # Dinic 最大流：硬约束可行性与瓶颈定位
-    solver.ts       # 主流程 + ILP 建模（javascript-lp-solver）
-  components/       # 录入与结果展示组件
-  types.ts          # 数据模型
+    solver.ts       # 主流程 + ILP 建模（javascript-lp-solver）；导出可复用的 evaluateHardConstraints
+    stress.ts       # 评审人缺席压力测试：逐位容量置 0 后复用硬约束判定，输出 Hall 瓶颈诊断与数据指纹
+  components/
+    StressPanel.tsx # 缺席压力测试面板（运行 / 过期提示 / 汇总 / 逐场景明细 / 导出）
+    …               # 录入与结果展示组件
+  types.ts          # 数据模型（含压力测试报告类型）
   storage.ts        # localStorage 持久化
-  exporter.ts       # 结果 JSON 导出
+  exporter.ts       # 分配结果 / 压力测试报告 JSON 导出
   sampleData.ts     # 示例数据
 Dockerfile          # 多阶段构建：Node 构建 + nginx 静态托管
-docker-compose.yml  # 一条命令启动
+docker-compose.yml  # 一条命令启动（http://localhost:8080）
 ```
