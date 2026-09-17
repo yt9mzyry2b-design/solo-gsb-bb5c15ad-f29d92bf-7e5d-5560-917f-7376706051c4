@@ -6,7 +6,7 @@ interface ResultPanelProps {
   onExport: () => void
 }
 
-const kindLabel: Record<string, string> = {
+export const kindLabel: Record<string, string> = {
   'global-capacity': '全局容量不足',
   'paper-eligible': '单篇稿件可分配人数不足',
   'subset-bottleneck': '组合性瓶颈（局部容量不足）'

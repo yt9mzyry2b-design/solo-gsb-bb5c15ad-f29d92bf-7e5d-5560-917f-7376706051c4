@@ -2,14 +2,16 @@ import { useEffect, useMemo, useState } from 'react'
 import type { AppData, AssignmentResult, Paper, Reviewer } from './types'
 import { loadData, saveData } from './storage'
 import { solveAssignment } from './engine/solver'
+import { runAbsenceStressTest, type StressTestOutcome } from './engine/stressTest'
 import { createSampleData } from './sampleData'
-import { buildExportPayload, downloadJson } from './exporter'
+import { buildExportPayload, buildStressExportPayload, downloadJson } from './exporter'
 import { PapersPanel } from './components/PapersPanel'
 import { ReviewersPanel } from './components/ReviewersPanel'
 import { ResultPanel } from './components/ResultPanel'
+import { StressTestPanel } from './components/StressTestPanel'
 import './styles.css'
 
-type Tab = 'papers' | 'reviewers' | 'result'
+type Tab = 'papers' | 'reviewers' | 'result' | 'stress'
 
 const EMPTY: AppData = { papers: [], reviewers: [] }
 
@@ -20,11 +22,16 @@ export default function App() {
   const [stale, setStale] = useState(false)
   const [solving, setSolving] = useState(false)
   const [solveMillis, setSolveMillis] = useState<number | null>(null)
+  const [stressOutcome, setStressOutcome] = useState<StressTestOutcome | null>(null)
+  const [stressStale, setStressStale] = useState(false)
+  const [stressRunning, setStressRunning] = useState(false)
+  const [stressMillis, setStressMillis] = useState<number | null>(null)
 
-  // 数据变化自动持久化到 localStorage；已有结果则标记为过期
+  // 数据变化自动持久化到 localStorage；已有结果 / 压力测试报告则标记为过期
   useEffect(() => {
     saveData(data)
     setStale((s) => (result ? true : s))
+    setStressStale((s) => (stressOutcome ? true : s))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data])
 
@@ -58,6 +65,9 @@ export default function App() {
     setData(createSampleData())
     setResult(null)
     setStale(false)
+    setStressOutcome(null)
+    setStressStale(false)
+    setStressMillis(null)
   }
 
   const clearAll = () => {
@@ -65,10 +75,32 @@ export default function App() {
     setData(EMPTY)
     setResult(null)
     setStale(false)
+    setStressOutcome(null)
+    setStressStale(false)
+    setStressMillis(null)
   }
 
   const exportResult = () => {
     if (result?.feasible) downloadJson(buildExportPayload(data, result))
+  }
+
+  const runStressTest = () => {
+    // 让“模拟中”状态先渲染，再执行逐人缺席模拟（纯最大流判定，通常很快）
+    setStressRunning(true)
+    setTimeout(() => {
+      const t0 = performance.now()
+      const outcome = runAbsenceStressTest(data)
+      setStressMillis(Math.round(performance.now() - t0))
+      setStressOutcome(outcome)
+      setStressStale(false)
+      setStressRunning(false)
+    }, 30)
+  }
+
+  const exportStress = () => {
+    if (stressOutcome?.status === 'ok') {
+      downloadJson(buildStressExportPayload(data, stressOutcome.report), 'blind-review-stress-test')
+    }
   }
 
   const totalRequired = data.papers.reduce((a, p) => a + Math.max(0, p.reviewsRequired || 0), 0)
@@ -111,6 +143,10 @@ export default function App() {
           分配结果
           {stale && <span className="stale-dot" title="数据已变更，结果可能过期">●</span>}
         </button>
+        <button className={tab === 'stress' ? 'tab active' : 'tab'} onClick={() => setTab('stress')}>
+          缺席压力测试
+          {stressStale && <span className="stale-dot" title="数据已变更，压力测试结果已过期">●</span>}
+        </button>
         {solveMillis !== null && <span className="solve-time">本地求解耗时 {solveMillis} ms</span>}
       </nav>
 
@@ -125,6 +161,17 @@ export default function App() {
           ) : (
             <ResultPanel data={data} result={result} onExport={exportResult} />
           ))}
+        {tab === 'stress' && (
+          <StressTestPanel
+            data={data}
+            outcome={stressOutcome}
+            stale={stressStale}
+            running={stressRunning}
+            runMillis={stressMillis}
+            onRun={runStressTest}
+            onExport={exportStress}
+          />
+        )}
       </main>
 
       <footer className="app-footer">

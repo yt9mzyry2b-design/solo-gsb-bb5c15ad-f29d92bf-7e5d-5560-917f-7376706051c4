@@ -1,4 +1,5 @@
 import { solveAssignment } from '../src/engine/solver'
+import { runAbsenceStressTest } from '../src/engine/stressTest'
 import type { AppData } from '../src/types'
 
 let pass = 0
@@ -138,6 +139,57 @@ const R = (id: string, name: string, capacity: number, tags: string[] = [], conf
   const ms = Date.now() - t0
   console.log(`用例8 规模 30x12（${ms} ms）`)
   check('可行且 90 个名额', res.feasible && res.objective.totalAssigned === 90, JSON.stringify(res.feasible ? res.objective : res.reasons))
+}
+
+// 9. 缺席压力测试：混合结果（仍可分配 / 不可分配），容量 0 者跳过，数据不被修改
+{
+  const d = mk(
+    [P('p1', 'A', 2), P('p2', 'B', 2)],
+    [R('a', '甲', 2), R('b', '乙', 2), R('c', '丙', 1), R('z', '闲', 0)]
+  )
+  const before = JSON.stringify(d)
+  const out = runAbsenceStressTest(d)
+  console.log('用例9 缺席压力测试·混合结果')
+  check('基线可行，返回 ok', out.status === 'ok')
+  if (out.status === 'ok') {
+    check('测试 3 人（容量 0 的 z 被跳过）', out.report.testedCount === 3, `got ${out.report.testedCount}`)
+    check('仍可分配 1 人（丙）', out.report.assignable.length === 1 && out.report.assignable[0].reviewerId === 'c')
+    check('不可分配 2 人（甲、乙）', out.report.infeasible.length === 2)
+    const a = out.report.infeasible.find((x) => x.reviewerId === 'a')
+    check('甲缺席名额缺口=1', a?.deficit === 1, `got ${a?.deficit}`)
+    check('甲缺席受影响稿件为 p1,p2', a?.affectedPaperIds.length === 2, JSON.stringify(a?.affectedPaperIds))
+    check('瓶颈名单不含缺席者本人', !!a && !a.bottleneckReviewerIds.includes('a'))
+    check('瓶颈名单含乙、丙', !!a && a.bottleneckReviewerIds.includes('b') && a.bottleneckReviewerIds.includes('c'))
+    check('不可分配项附具体原因', !!a && a.reasons.length > 0)
+  }
+  check('录入数据未被修改', JSON.stringify(d) === before)
+}
+
+// 10. 缺席压力测试：基线不可行 → 不执行模拟
+{
+  const d = mk([P('p1', 'A', 2)], [R('a', '甲', 1)])
+  const out = runAbsenceStressTest(d)
+  console.log('用例10 缺席压力测试·基线不可行')
+  check('返回 base-infeasible', out.status === 'base-infeasible')
+  if (out.status === 'base-infeasible') check('附带既有可行性原因', out.reasons.length > 0)
+}
+
+// 11. 缺席压力测试：冲突型瓶颈诊断（缺席后瓶颈评审人定位精确）
+{
+  const d = mk(
+    [P('p1', 'A', 2), P('p2', 'B', 2)],
+    [R('a', '甲', 2), R('b', '乙', 2), R('c', '丙', 5, [], ['p1', 'p2'])]
+  )
+  const out = runAbsenceStressTest(d)
+  console.log('用例11 缺席压力测试·冲突型瓶颈')
+  check('基线可行，返回 ok', out.status === 'ok')
+  if (out.status === 'ok') {
+    const a = out.report.infeasible.find((x) => x.reviewerId === 'a')
+    check('甲缺席缺口=2', a?.deficit === 2, `got ${a?.deficit}`)
+    check('甲缺席受影响稿件为 p1,p2', a?.affectedPaperIds.length === 2)
+    check('瓶颈仅乙（丙与全部稿件冲突）', a?.bottleneckReviewerIds.length === 1 && a.bottleneckReviewerIds[0] === 'b', JSON.stringify(a?.bottleneckReviewerIds))
+    check('丙缺席仍可分配（丙本就无法承担任何稿件）', out.report.assignable.some((x) => x.reviewerId === 'c'))
+  }
 }
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)

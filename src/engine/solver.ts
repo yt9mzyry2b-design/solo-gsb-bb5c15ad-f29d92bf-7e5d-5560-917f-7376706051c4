@@ -27,12 +27,11 @@ function normalizeTags(raw: string[]): string[] {
   return out
 }
 
-interface Normalized {
-  papers: Paper[]
-  reviewers: Reviewer[]
-}
-
-function normalize(data: AppData): Normalized {
+/**
+ * 数据规范化：去空白、需求/容量取整、剔除无效记录。
+ * 求解与压力测试共用，保证判定口径一致。
+ */
+export function normalizeData(data: AppData): AppData {
   const papers: Paper[] = data.papers
     .map((p) => ({
       ...p,
@@ -69,41 +68,86 @@ function matchedTagsOf(paper: Paper, reviewer: Reviewer): string[] {
   return paper.tags.filter((t) => rSet.has(tagKey(t)))
 }
 
+/** 规范化后的可计算问题 */
+interface NormalizedProblem {
+  papers: Paper[]
+  reviewers: Reviewer[]
+  /** eligible[i][j] = true 表示稿件 i 与评审人 j 无利益冲突、可分配 */
+  eligible: boolean[][]
+  demands: number[]
+  capacities: number[]
+  totalRequired: number
+  totalCapacity: number
+}
+
+function buildProblem(rawData: AppData): NormalizedProblem {
+  const { papers, reviewers } = normalizeData(rawData)
+  const eligible = papers.map((p) => reviewers.map((r) => !hasConflict(p, r)))
+  const demands = papers.map((p) => p.reviewsRequired)
+  const capacities = reviewers.map((r) => r.capacity)
+  return {
+    papers,
+    reviewers,
+    eligible,
+    demands,
+    capacities,
+    totalRequired: demands.reduce((a, b) => a + b, 0),
+    totalCapacity: capacities.reduce((a, b) => a + b, 0)
+  }
+}
+
+/** 硬约束可行性分析结果：求解与压力测试共用的判定输出 */
+export interface FeasibilityAnalysis {
+  feasible: boolean
+  /** 不可行时的具体原因（单篇不足 / 全局容量 / 组合性瓶颈） */
+  reasons: InfeasibleReason[]
+  totalRequired: number
+  totalCapacity: number
+  /** 名额缺口：总需求 − 当前最多可分配数（可行时为 0） */
+  deficit: number
+  /** 受影响稿件 id（最大流最小割源侧稿件集合） */
+  affectedPaperIds: string[]
+  /** 可选评审人瓶颈：与受影响稿件无冲突的评审人 id */
+  bottleneckReviewerIds: string[]
+}
+
 /**
- * 核心入口：执行盲审分配。
- *
- * 硬约束（全部必须满足，否则不可行）:
- *  1. 利益冲突：声明冲突的稿件-评审人对绝不分配；
- *  2. 容量：每位评审人承担稿件数不超过 capacity；
- *  3. 人数：每篇稿件恰好得到 reviewsRequired 位互不相同的评审人。
- *
- * 优化目标（硬约束满足后）:
- *  第一优先 最大化稿件主题标签与评审人擅长标签的匹配数；
- *  第二优先 最小化评审人最大负载（负载均衡）。
+ * 既有硬约束可行性逻辑（唯一判定口径）：
+ * 冲突矩阵 → 单篇人数检查 → 全局容量检查 → Dinic 最大流 → 最小割瓶颈见证。
  */
-export function solveAssignment(rawData: AppData): AssignmentResult {
-  const { papers, reviewers } = normalize(rawData)
+function analyzeProblem(prob: NormalizedProblem): FeasibilityAnalysis {
+  const { papers, reviewers, eligible, demands, capacities, totalRequired, totalCapacity } = prob
   const P = papers.length
   const R = reviewers.length
   const reasons: InfeasibleReason[] = []
+  const totals = { totalRequired, totalCapacity }
 
   // ---- 退化情形 ----
   if (P === 0) {
-    return { feasible: false, reasons: [{ kind: 'paper-eligible', message: '没有需要分配的有效稿件（请至少录入一篇需要评审的稿件）。' }] }
+    return {
+      ...totals,
+      feasible: false,
+      reasons: [{ kind: 'paper-eligible', message: '没有需要分配的有效稿件（请至少录入一篇需要评审的稿件）。' }],
+      deficit: 0,
+      affectedPaperIds: [],
+      bottleneckReviewerIds: []
+    }
   }
   if (R === 0) {
-    reasons.push({
-      kind: 'global-capacity',
-      message: `尚未录入任何评审人，${papers.reduce((a, p) => a + p.reviewsRequired, 0)} 个评审名额无人承担。`
-    })
-    return { feasible: false, reasons }
+    return {
+      ...totals,
+      feasible: false,
+      reasons: [
+        {
+          kind: 'global-capacity',
+          message: `尚未录入任何评审人，${totalRequired} 个评审名额无人承担。`
+        }
+      ],
+      deficit: totalRequired,
+      affectedPaperIds: papers.map((p) => p.id),
+      bottleneckReviewerIds: []
+    }
   }
-
-  // ---- 冲突矩阵 ----
-  const eligible: boolean[][] = papers.map((p) => reviewers.map((r) => !hasConflict(p, r)))
-  const demands = papers.map((p) => p.reviewsRequired)
-  const capacities = reviewers.map((r) => r.capacity)
-  const totalRequired = demands.reduce((a, b) => a + b, 0)
 
   // ---- 原因 1（最具体）：单篇稿件可分配评审人数不足 ----
   const perPaperFailures: InfeasibleReason[] = []
@@ -119,7 +163,6 @@ export function solveAssignment(rawData: AppData): AssignmentResult {
   }
 
   // ---- 全局容量（忽略冲突后所有评审人可承担的总名额）----
-  const totalCapacity = capacities.reduce((a, b) => a + b, 0)
   if (totalCapacity < totalRequired) {
     reasons.push({
       kind: 'global-capacity',
@@ -131,45 +174,83 @@ export function solveAssignment(rawData: AppData): AssignmentResult {
   // ---- 最大流可行性检验 ----
   const feas = checkFeasibility({ demands, capacities, eligible })
 
-  if (!feas.feasible && reasons.length === 0 && perPaperFailures.length === 0) {
-    // 组合性瓶颈（广义 Hall 条件违反）：
-    // 取残量网源侧可达稿件集合 Z，令 Y 为与 Z 中任一稿件无冲突的全部评审人。
+  let deficit = 0
+  let affectedPaperIds: string[] = []
+  let bottleneckReviewerIds: string[] = []
+
+  if (!feas.feasible) {
+    // 最小割紧见证：取残量网源侧可达稿件集合 Z，令 Y 为与 Z 中任一稿件无冲突的全部评审人。
     // 因 Z→(R\Y) 的边在最大流中全部饱和，Y 是紧见证：
-    //   demand(Z) > Σ_j∈Y min(容量_j, |Z 中与 j 相连的稿件数|)。
+    //   名额缺口 = demand(Z) − Σ_j∈Y min(容量_j, Z 中与 j 相连的稿件数)。
     const Zidx = feas.sourceReachablePapers
-    const Zset = Zidx.map((i) => papers[i])
     const Yidx: number[] = []
     for (let j = 0; j < R; j++) {
       if (Zidx.some((i) => eligible[i][j])) Yidx.push(j)
     }
-    const Yset = Yidx.map((j) => reviewers[j])
-    const demandZ = Zset.reduce((a, p) => a + p.reviewsRequired, 0)
+    const demandZ = Zidx.reduce((a, i) => a + demands[i], 0)
     let capY = 0
     for (const j of Yidx) {
       const degree = Zidx.reduce((n, i) => n + (eligible[i][j] ? 1 : 0), 0)
-      capY += Math.min(reviewers[j].capacity, degree)
+      capY += Math.min(capacities[j], degree)
     }
-    reasons.push({
-      kind: 'subset-bottleneck',
-      paperIds: Zset.map((p) => p.id),
-      reviewerIds: Yset.map((r) => r.id),
-      deficit: demandZ - capY,
-      message:
-        `存在一组 ${Zset.length} 篇稿件，其可选评审人范围相互重叠、形成容量瓶颈：它们共需 ${demandZ} 个名额，` +
-        `而 ${Yset.length} 位无冲突的评审人对这组稿件至多能承担 ${capY} 个名额（缺口 ${demandZ - capY}，已计入每位评审人对同一篇稿件至多评一次）。\n` +
-        `瓶颈稿件：${Zset.map((p) => `《${p.title}》`).join('、')}；\n` +
-        `可选评审人：${Yset.length ? Yset.map((r) => r.name).join('、') : '（无，全部存在利益冲突）'}。\n` +
-        `建议：为这些稿件补充评审人、解除部分冲突或提高相关评审人容量。`
-    })
+    deficit = demandZ - capY
+    affectedPaperIds = Zidx.map((i) => papers[i].id)
+    bottleneckReviewerIds = Yidx.map((j) => reviewers[j].id)
+
+    if (reasons.length === 0 && perPaperFailures.length === 0) {
+      // 组合性瓶颈（广义 Hall 条件违反）：单篇与全局检查均未暴露问题时给出
+      const Zset = Zidx.map((i) => papers[i])
+      const Yset = Yidx.map((j) => reviewers[j])
+      reasons.push({
+        kind: 'subset-bottleneck',
+        paperIds: Zset.map((p) => p.id),
+        reviewerIds: Yset.map((r) => r.id),
+        deficit,
+        message:
+          `存在一组 ${Zset.length} 篇稿件，其可选评审人范围相互重叠、形成容量瓶颈：它们共需 ${demandZ} 个名额，` +
+          `而 ${Yset.length} 位无冲突的评审人对这组稿件至多能承担 ${capY} 个名额（缺口 ${deficit}，已计入每位评审人对同一篇稿件至多评一次）。\n` +
+          `瓶颈稿件：${Zset.map((p) => `《${p.title}》`).join('、')}；\n` +
+          `可选评审人：${Yset.length ? Yset.map((r) => r.name).join('、') : '（无，全部存在利益冲突）'}。\n` +
+          `建议：为这些稿件补充评审人、解除部分冲突或提高相关评审人容量。`
+      })
+    }
   }
 
   if (!feas.feasible) {
     // 优先展示具体原因：单篇不足在前，全局/组合性在后
-    return { feasible: false, reasons: [...perPaperFailures, ...reasons] }
+    return { ...totals, feasible: false, reasons: [...perPaperFailures, ...reasons], deficit, affectedPaperIds, bottleneckReviewerIds }
   }
 
+  return { ...totals, feasible: true, reasons: [], deficit: 0, affectedPaperIds: [], bottleneckReviewerIds: [] }
+}
+
+/**
+ * 仅做硬约束可行性判定（不执行目标优化）。
+ * 评审人缺席压力测试等场景复用该入口，保证与「生成分派」完全相同的判定口径。
+ */
+export function analyzeFeasibility(rawData: AppData): FeasibilityAnalysis {
+  return analyzeProblem(buildProblem(rawData))
+}
+
+/**
+ * 核心入口：执行盲审分配。
+ *
+ * 硬约束（全部必须满足，否则不可行）:
+ *  1. 利益冲突：声明冲突的稿件-评审人对绝不分配；
+ *  2. 容量：每位评审人承担稿件数不超过 capacity；
+ *  3. 人数：每篇稿件恰好得到 reviewsRequired 位互不相同的评审人。
+ *
+ * 优化目标（硬约束满足后）:
+ *  第一优先 最大化稿件主题标签与评审人擅长标签的匹配数；
+ *  第二优先 最小化评审人最大负载（负载均衡）。
+ */
+export function solveAssignment(rawData: AppData): AssignmentResult {
+  const prob = buildProblem(rawData)
+  const analysis = analyzeProblem(prob)
+  if (!analysis.feasible) return { feasible: false, reasons: analysis.reasons }
+
   // ---- 硬约束可行：用整数规划做目标优化 ----
-  return optimize(papers, reviewers, eligible, demands, totalRequired)
+  return optimize(prob.papers, prob.reviewers, prob.eligible, prob.demands, prob.totalRequired)
 }
 
 /* ------------------------------ 整数规划优化 ------------------------------ */
